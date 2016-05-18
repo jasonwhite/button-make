@@ -19,6 +19,7 @@ this program.  If not, see <http://www.gnu.org/licenses/>.  */
 #include <assert.h>
 
 #include "job.h"
+#include "dep.h"
 #include "debug.h"
 #include "filedef.h"
 #include "commands.h"
@@ -217,6 +218,7 @@ int remote_status (int *exit_code_ptr, int *signal_ptr, int *coredump_ptr,
 RETSIGTYPE child_handler (int);
 static void free_child (struct child *);
 static void start_job_command (struct child *child);
+static void start_job_command_json (struct child *child);
 static int load_too_high (void);
 static int job_next_command (struct child *);
 static int start_waiting_job (struct child *);
@@ -912,7 +914,7 @@ reap_children (int block, int err)
                      Also, start_remote_job may need state set up
                      by start_remote_job_p.  */
                   c->remote = start_remote_job_p (0);
-                  start_job_command (c);
+                  start_job_command_json (c);
                   /* Fatal signals are left blocked in case we were
                      about to put that child on the chain.  But it is
                      already there, so it is safe for a fatal signal to
@@ -1139,6 +1141,224 @@ set_child_handler_action_flags (int set_handler, int set_alarm)
 }
 #endif
 
+
+static const char  json_escape_chars[] = {'\"',   '\t',  '\r',  '\n',  '\b',  '\\',  '\0'};
+static const char* json_replacements[] = {"\\\"", "\\t", "\\r", "\\n", "\\b", "\\\\", NULL};
+
+/* For the given character, returns the equivalent JSON escape sequence. If the
+   given character is not a character to be escaped, returns NULL.  */
+
+static void
+print_json_char(FILE* f, char c)
+{
+  for (size_t i = 0; json_escape_chars[i] != '\0'; ++i)
+  {
+    if (json_escape_chars[i] == c)
+    {
+      fputs(json_replacements[i], f);
+      return;
+    }
+  }
+
+  /* Doesn't need escaping. Just print it. */
+  fputc(c, f);
+}
+
+/* Prints a string in JSON format to the given stream.  */
+
+static void
+print_json_string(FILE* f, const char* s)
+{
+  fputc('"', f);
+
+  for (; *s; ++s)
+    print_json_char(f, *s);
+
+  fputc('"', f);
+}
+
+/* Prints an array of strings in JSON format to the given stream. */
+
+static void
+print_json_string_array(FILE* f, char** array)
+{
+  fputs("[", f);
+
+  if (*array)
+  {
+    print_json_string(f, *array);
+
+    ++array;
+
+    for (; *array; ++array)
+    {
+      fputs(", ", f);
+      print_json_string(f, *array);
+    }
+  }
+
+  fputs("]", f);
+}
+
+/* Returns the next argument array for the given child. Returns NULL when there
+   are no more commands for this child. If non-NULL, the returned argument array
+   must be freed. */
+
+static char**
+job_next_argv(struct child* child)
+{
+  int flags;
+  char *p;
+  char **argv;
+
+  /* If we have a completely empty commandset, stop now.  */
+  if (!child->command_ptr && !job_next_command(child))
+      return NULL;
+
+  /* Combine the flags parsed for the line itself with
+     the flags specified globally for this target.  */
+  flags = (child->file->command_flags
+           | child->file->cmds->lines_flags[child->command_line - 1]);
+
+  p = child->command_ptr;
+  child->noerror = ((flags & COMMANDS_NOERROR) != 0);
+
+  while (*p != '\0')
+    {
+      if (*p == '@')
+        flags |= COMMANDS_SILENT;
+      else if (*p == '+')
+        flags |= COMMANDS_RECURSE;
+      else if (*p == '-')
+        child->noerror = 1;
+      else if (!isblank ((unsigned char)*p))
+        break;
+      ++p;
+    }
+
+  /* Update the file's command flags with any new ones we found.  We only
+     keep the COMMANDS_RECURSE setting.  Even this isn't 100% correct; we are
+     now marking more commands recursive than should be in the case of
+     multiline define/endef scripts where only one line is marked "+".  In
+     order to really fix this, we'll have to keep a lines_flags for every
+     actual line, after expansion.  */
+  child->file->cmds->lines_flags[child->command_line - 1]
+    |= flags & COMMANDS_RECURSE;
+
+  /* POSIX requires that a recipe prefix after a backslash-newline should
+     be ignored.  Remove it now so the output is correct.  */
+  {
+    char prefix = child->file->cmds->recipe_prefix;
+    char *p1, *p2;
+    p1 = p2 = p;
+    while (*p1 != '\0')
+      {
+        *(p2++) = *p1;
+        if (p1[0] == '\n' && p1[1] == prefix)
+          ++p1;
+        ++p1;
+      }
+    *p2 = *p1;
+  }
+
+  /* Figure out an argument list from this command line.  */
+  {
+    char *end = 0;
+    argv = construct_command_argv (p, &end, child->file,
+                                   child->file->cmds->lines_flags[child->command_line - 1],
+                                   &child->sh_batch_file);
+    if (end == NULL)
+      child->command_ptr = NULL;
+    else
+      {
+        *end++ = '\0';
+        child->command_ptr = end;
+      }
+  }
+
+  job_next_command(child);
+
+  return argv;
+}
+
+/* Like start_job_command below, but prints a JSON build description to be
+   consumed by Brilliant Build.  */
+
+static void
+start_job_command_json (struct child* child)
+{
+  char **argv;
+
+  {
+    /* Print the rule that would have run. This includes input files, the task,
+       and the output file.  */
+    const struct dep *d;
+
+    puts("{");
+
+    /* Inputs */
+    printf("    \"inputs\": [");
+    if (child->file && (d = child->file->deps))
+    {
+      if (d->file && !d->file->phony)
+        print_json_string(stdout, d->file->name);
+
+      d = d->next;
+
+      for (; d; d = d->next)
+      {
+        if (d->file && !d->file->phony)
+        {
+          printf(", ");
+          print_json_string(stdout, d->file->name);
+        }
+      }
+    }
+
+    puts("],");
+  }
+
+  fputs("    \"task\": [", stdout);
+
+  /* Print each command in the task.  */
+  if ((argv = job_next_argv(child)))
+  {
+    fputs("\n        ", stdout);
+    print_json_string_array(stdout, argv);
+
+    ++commands_started;
+    free (argv[0]);
+    free (argv);
+
+    while ((argv = job_next_argv(child)))
+    {
+      fputs(",\n        ", stdout);
+      print_json_string_array(stdout, argv);
+
+      ++commands_started;
+      free (argv[0]);
+      free (argv);
+    }
+  }
+
+  puts("\n    ],");
+
+  {
+    /* Output (only ever one of them) */
+    printf("    \"outputs\": [");
+    if (child->file && child->file->name && !child->file->phony)
+      print_json_string(stdout, child->file->name);
+    puts("]");
+
+    puts("},");
+  }
+
+  /* No more commands.  Make sure we're "running"; we might not be if
+     (e.g.) all commands were skipped due to -n.  */
+  set_command_state (child->file, cs_running);
+  child->file->update_status = us_success;
+  notice_finished_file (child->file);
+}
 
 /* Start a job to run the commands specified in CHILD.
    CHILD is updated to reflect the commands and ID of the child process.
@@ -1746,7 +1966,7 @@ start_waiting_job (struct child *c)
     }
 
   /* Start the first command; reap_children will run later command lines.  */
-  start_job_command (c);
+  start_job_command_json (c);
 
   switch (f->command_state)
     {

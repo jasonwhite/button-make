@@ -182,7 +182,7 @@ int touch_flag;
 /* Nonzero means just print what commands would need to be executed,
    don't actually execute them (-n).  */
 
-int just_print_flag;
+int just_print_flag = 1;
 
 /* Print debugging info (--debug).  */
 
@@ -323,7 +323,7 @@ int warn_undefined_variables_flag;
 /* If nonzero, always build all targets, regardless of whether
    they appear out of date or not.  */
 
-static int always_make_set = 0;
+static int always_make_set = 1;
 int always_make_flag = 0;
 
 /* If nonzero, we're in the "try to rebuild makefiles" phase.  */
